@@ -10,11 +10,15 @@ app.use(express.json({ limit: "100kb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
 const PORT = process.env.PORT || 3000;
-const KEY = process.env.GEMINI_API_KEY;
-const DEFAULT_MODEL = process.env.GEMINI_MODEL || "gemma-3-27b-it";
-const MODELS = (process.env.GEMINI_MODELS || "gemma-3-27b-it,gemma-3-12b-it,gemma-3-4b-it")
+// AI_PROVIDER=ollama (local, VS Code) or gemini (deployed on Render)
+const PROVIDER = (process.env.AI_PROVIDER || "ollama").toLowerCase();
+const OLLAMA_HOST = process.env.OLLAMA_HOST || "http://localhost:11434";
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "gemma3:4b";
+const GEMINI_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemma-4-31b-it";
+const GEMINI_MODELS = (process.env.GEMINI_MODELS || "gemma-4-31b-it,gemma-4-26b-a4b-it")
   .split(",").map(s => s.trim()).filter(Boolean);
-if (!MODELS.includes(DEFAULT_MODEL)) MODELS.unshift(DEFAULT_MODEL);
+if (!GEMINI_MODELS.includes(GEMINI_MODEL)) GEMINI_MODELS.unshift(GEMINI_MODEL);
 
 // Tiny in-memory rate limit: 10 requests per minute per IP
 const hits = new Map();
@@ -26,7 +30,7 @@ function limited(ip) {
   return recent.length > 10;
 }
 
-// Gemma models on the Gemini API take no system instruction, so the rules go in the prompt.
+// One prompt for both providers (Gemma on the Gemini API accepts no system instruction)
 const buildPrompt = chat => `You summarise chat logs for a busy person.
 Reply with ONLY a JSON object, no markdown, in exactly this shape:
 {"two_liner":"max two short sentences","needs_you":[{"who":"person or group","what":"concrete action with exact deadline"}],"ignore":["short phrase for noise"]}
@@ -47,42 +51,86 @@ function extractJson(text) {
   };
 }
 
-app.get("/api/health", (_req, res) =>
-  res.json({ ok: true, configured: Boolean(KEY), models: MODELS, defaultModel: DEFAULT_MODEL }));
+async function ollamaModels() {
+  try {
+    const r = await fetch(`${OLLAMA_HOST}/api/tags`, { signal: AbortSignal.timeout(2000) });
+    const d = await r.json();
+    const names = (d.models || []).map(m => m.name);
+    return names.sort((a, b) => /gemma/.test(b) - /gemma/.test(a));
+  } catch { return []; }
+}
+
+async function listModels() {
+  if (PROVIDER === "gemini") {
+    return { configured: Boolean(GEMINI_KEY), models: GEMINI_MODELS, defaultModel: GEMINI_MODEL };
+  }
+  const models = await ollamaModels();
+  const defaultModel = models.includes(OLLAMA_MODEL) ? OLLAMA_MODEL : (models[0] || OLLAMA_MODEL);
+  return { configured: models.length > 0, models: models.length ? models : [OLLAMA_MODEL], defaultModel };
+}
+
+async function askOllama(model, prompt) {
+  const r = await fetch(`${OLLAMA_HOST}/api/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model, stream: false, format: "json", options: { temperature: 0.2 },
+      messages: [{ role: "user", content: prompt }]
+    })
+  });
+  const d = await r.json();
+  if (!r.ok) throw new Error(d?.error || "Ollama request failed");
+  return d.message?.content || "";
+}
+
+async function askGemini(model, prompt) {
+  const r = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-goog-api-key": GEMINI_KEY },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        generationConfig: { temperature: 0.2, maxOutputTokens: 900 }
+      })
+    }
+  );
+  const d = await r.json();
+  if (!r.ok) throw new Error(d?.error?.message || "Gemini request failed");
+  return (d.candidates?.[0]?.content?.parts || []).filter(p => !p.thought).map(p => p.text || "").join("");
+}
+
+app.get("/api/health", async (_req, res) => {
+  res.json({ ok: true, provider: PROVIDER, ...(await listModels()) });
+});
 
 app.post("/api/digest", async (req, res) => {
-  if (!KEY) return res.status(503).json({ error: "Server has no GEMINI_API_KEY set." });
   if (limited(req.ip)) return res.status(429).json({ error: "Slow down, sloth. Try again in a minute." });
-
+  const info = await listModels();
+  if (!info.configured) {
+    return res.status(503).json({
+      error: PROVIDER === "gemini"
+        ? "Server has no GEMINI_API_KEY set."
+        : `Ollama is not reachable at ${OLLAMA_HOST} or has no models. Run: ollama pull ${OLLAMA_MODEL}`
+    });
+  }
   const chat = String(req.body?.chat || "").trim().slice(0, 12000);
-  const model = MODELS.includes(req.body?.model) ? req.body.model : DEFAULT_MODEL;
   if (!chat) return res.status(400).json({ error: "Paste some chat text first." });
+  const model = info.models.includes(req.body?.model) ? req.body.model : info.defaultModel;
 
   const t0 = Date.now();
   try {
-    const r = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "x-goog-api-key": KEY },
-        body: JSON.stringify({
-          contents: [{ role: "user", parts: [{ text: buildPrompt(chat) }] }],
-          generationConfig: { temperature: 0.2, maxOutputTokens: 900 }
-        })
-      }
-    );
-    const data = await r.json();
-    if (!r.ok) {
-      console.error("Gemini error:", data?.error?.message);
-      return res.status(502).json({ error: data?.error?.message || "The model request failed." });
-    }
-    const text = (data.candidates?.[0]?.content?.parts || []).map(p => p.text || "").join("");
+    const text = PROVIDER === "gemini"
+      ? await askGemini(model, buildPrompt(chat))
+      : await askOllama(model, buildPrompt(chat));
     const digest = extractJson(text);
-    res.json({ ...digest, model, seconds: +((Date.now() - t0) / 1000).toFixed(1) });
+    res.json({ ...digest, model, provider: PROVIDER, seconds: +((Date.now() - t0) / 1000).toFixed(1) });
   } catch (e) {
-    console.error(e);
-    res.status(502).json({ error: "The model answered in an unexpected format. Try again." });
+    console.error(e.message);
+    res.status(502).json({ error: e.message === "no json" || e instanceof SyntaxError
+      ? "The model answered in an unexpected format. Try again."
+      : e.message });
   }
 });
 
-app.listen(PORT, () => console.log(`Sloth Digest running on http://localhost:${PORT}`));
+app.listen(PORT, () => console.log(`Sloth Digest on http://localhost:${PORT} using ${PROVIDER}`));
