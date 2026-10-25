@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sloth Digest: read your group chats slowly, so you don't have to</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="wrap">
+<header>
+  <div class="branch" aria-hidden="true"></div>
+  <h1>Read the chat slowly, so you don't have to.</h1>
+  <p class="sub">Paste a noisy group chat. Open-weight Gemma hands back a two-line summary, the few things that need you, and what you can ignore.</p>
+  <div id="status" class="status" role="status"><span class="dot"></span><span id="statusText">Checking the server…</span></div>
+</header>
+
+<main>
+  <section class="panel" aria-labelledby="inH">
+    <h2 id="inH">Overnight chat</h2>
+    <p class="hint">Paste messages from WhatsApp, Telegram, Slack or email.</p>
+    <textarea id="chat" placeholder="Paste your messy chat here…" aria-label="Chat text" maxlength="12000"></textarea>
+    <div class="row">
+      <button class="btn primary" id="go">Summarise it for me</button>
+      <button class="btn" id="sample" type="button">Try a sample chat</button>
+      <span class="spacer"></span>
+      <label class="sel">Model <select id="model" aria-label="Model"></select></label>
+    </div>
+  </section>
+
+  <section class="panel" aria-labelledby="outH" aria-live="polite">
+    <h2 id="outH">Your digest</h2>
+    <div id="empty" class="empty"><b>Nothing to read yet.</b>Paste a chat and press Summarise. Then go back to doing nothing.</div>
+    <div id="slow" class="slow"><span>Reading slowly…</span><div class="track"><i></i></div></div>
+    <div id="out"></div>
+  </section>
+</main>
+<footer>Gemma (open weights) via the Gemini API · Node + Express · hosted on Render · your key never reaches the browser.</footer>
+</div>
+<script src="/app.js" defer></script>
+</body>
+</html>
